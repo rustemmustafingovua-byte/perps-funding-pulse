@@ -10,21 +10,21 @@ Bounty submission for [daydreamsai/agent-bounties#8 — Perps Funding Pulse](htt
 
 | Endpoint | Method | Payment |
 |---|---|---|
-| `https://877492b9a205ec.lhr.life/health` | GET | free |
-| `https://877492b9a205ec.lhr.life/funding` | POST | x402 — 0.001 USDC **or** native ETH on Base |
+| `https://f62f61cc3d3058.lhr.life/health` | GET | free |
+| `https://f62f61cc3d3058.lhr.life/funding` | POST | x402 — 0.001 USDC **or** native ETH on Base |
 
 ```bash
 # 1) health — бесплатно
-curl https://877492b9a205ec.lhr.life/health
+curl https://f62f61cc3d3058.lhr.life/health
 
 # 2) без оплаты сервис отвечает 402 + условиями оплаты
-curl -i -X POST https://877492b9a205ec.lhr.life/funding \
+curl -i -X POST https://f62f61cc3d3058.lhr.life/funding \
   -H 'content-type: application/json' \
   -d '{"venue_ids":["binance","bybit","okx"],"markets":["BTC/USDT","ETH/USDT"]}'
 
 # 3) оплата transfer-and-prove: отправьте 0.001 USDC (или ETH) на payTo
 #    и повторите запрос с заголовком X-PAYMENT-TX: <hash транзакции>
-curl -X POST https://877492b9a205ec.lhr.life/funding \
+curl -X POST https://f62f61cc3d3058.lhr.life/funding \
   -H 'content-type: application/json' \
   -H "x-payment-tx: 0x<tx hash>" \
   -d '{"venue_ids":["binance"],"markets":["BTC/USDT"]}'
@@ -40,7 +40,7 @@ Also listed in the official MCP Registry as
 `io.github.rustemmustafingovua-byte/perps-funding-pulse`.
 
 ```bash
-curl -X POST https://877492b9a205ec.lhr.life/mcp \
+curl -X POST https://f62f61cc3d3058.lhr.life/mcp \
   -H 'content-type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_funding","arguments":{"venue_ids":["binance","bybit","okx"],"markets":["BTC/USDT","ETH/USDT"]}}}'
 ```
