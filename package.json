@@ -1,0 +1,26 @@
+{
+  "name": "perps-funding-pulse",
+  "version": "0.1.0",
+  "description": "Live funding rates, next tick and open interest for perps markets, served over x402 — pay per call in USDC or ETH on Base.",
+  "type": "module",
+  "license": "MIT",
+  "main": "src/server.js",
+  "exports": {
+    ".": "./src/server.js",
+    "./venues": "./src/venues.js",
+    "./x402": "./src/x402.js"
+  },
+  "engines": { "node": ">=20" },
+  "keywords": ["x402", "perps", "funding-rate", "agents", "base", "usdc", "crypto", "defi"],
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test test/*.test.js",
+    "lint": "node --check src/server.js && node --check src/venues.js && node --check src/x402.js"
+  },
+  "dependencies": { "viem": "^2.57.7" },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rustemmustafingovua-byte/perps-funding-pulse.git"
+  },
+  "bugs": { "url": "https://github.com/rustemmustafingovua-byte/perps-funding-pulse/issues" }
+}
