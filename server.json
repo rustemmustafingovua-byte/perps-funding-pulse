@@ -1,0 +1,18 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.rustemmustafingovua-byte/perps-funding-pulse",
+  "description": "Live perps funding rate, next tick, open interest and skew (Binance, Bybit, OKX)",
+  "title": "perps-funding-pulse",
+  "version": "0.1.1",
+  "websiteUrl": "https://github.com/rustemmustafingovua-byte/perps-funding-pulse",
+  "repository": {
+    "url": "https://github.com/rustemmustafingovua-byte/perps-funding-pulse",
+    "source": "github"
+  },
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://0c5678d9815785.lhr.life/mcp"
+    }
+  ]
+}

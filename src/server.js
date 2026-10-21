@@ -10,6 +10,7 @@
 import { createServer } from "node:http"
 import { fundingPulse, VENUES } from "./venues.js"
 import { verifyPayment, paymentTerms, PAY_TO } from "./x402.js"
+import { handleMcp, handlePaidMcp, freeTier, FREE_LIMIT } from "./mcp.js"
 
 const PORT = Number(process.env.PORT || 8780)
 const PRICE_USD = Number(process.env.PRICE_USD || "0.001")
@@ -100,7 +101,40 @@ const server = createServer(async (req, res) => {
     })
   }
 
-  return json(res, 404, { error: "not_found", hint: "GET /health or POST /funding" })
+
+  if (req.method === "POST" && (url.pathname === "/mcp" || url.pathname === "/mcp/paid")) {
+    const chunks = []
+    for await (const c of req) chunks.push(c)
+    let body = {}
+    try {
+      body = JSON.parse(Buffer.concat(chunks).toString() || "{}")
+    } catch {
+      return json(res, 400, { error: "invalid_json" })
+    }
+    if (url.pathname === "/mcp/paid") {
+      const out = await handlePaidMcp({ body, txHash: req.headers["x-payment-tx"] })
+      return json(res, out.status, out.body, out.headers)
+    }
+    const ip = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.socket.remoteAddress || "unknown"
+    const tier = freeTier(ip)
+    if (!tier.allowed) {
+      const terms = await paymentTerms(PRICE_USD)
+      return json(
+        res,
+        402,
+        {
+          error: "payment_required",
+          message: `free tier exhausted (${FREE_LIMIT}/hour) — use /mcp/paid or pay $${PRICE_USD} USDC on Base`,
+          terms,
+        },
+        { "payment-required": Buffer.from(JSON.stringify(terms)).toString("base64") },
+      )
+    }
+    const out = await handleMcp({ body, ip, paid: false })
+    return json(res, 200, out, { "x-free-tier-left": String(tier.left) })
+  }
+
+  return json(res, 404, { error: "not_found", hint: "GET /health, POST /funding, POST /mcp, POST /mcp/paid" })
 })
 
 const USDC_LIKE = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"

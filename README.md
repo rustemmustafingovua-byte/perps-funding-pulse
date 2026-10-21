@@ -34,6 +34,21 @@ The service verifies the payment on Base by reading the transaction
 (native ETH transfer → `to == payTo`, or a USDC `Transfer` event → `to == payTo`).
 **The client pays the gas; the server spends nothing.**
 
+### MCP
+
+Also listed in the official MCP Registry as
+`io.github.rustemmustafingovua-byte/perps-funding-pulse`.
+
+```bash
+curl -X POST https://f2691024db475f.lhr.life/mcp \
+  -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_funding","arguments":{"venue_ids":["binance","bybit","okx"],"markets":["BTC/USDT","ETH/USDT"]}}}'
+```
+
+Tool: `get_funding` — same payload as `POST /funding`. The free tier allows 20 calls per
+hour per IP; past that the endpoint answers `402` with the x402 terms, and
+`/mcp/paid` always requires payment (send the transaction hash in `X-PAYMENT-TX`).
+
 ## What it returns
 
 ```json
