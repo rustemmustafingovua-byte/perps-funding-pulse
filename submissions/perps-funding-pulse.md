@@ -8,8 +8,8 @@
 
 | Endpoint | Method | Payment |
 |---|---|---|
-| `https://d76d5f156d10ef.lhr.life/health` | GET | free |
-| `https://d76d5f156d10ef.lhr.life/funding` | POST | x402 — 0.001 USDC **or** native ETH on Base |
+| `https://891bc5312de56e.lhr.life/health` | GET | free |
+| `https://891bc5312de56e.lhr.life/funding` | POST | x402 — 0.001 USDC **or** native ETH on Base |
 
 `POST /funding` without payment returns **HTTP 402** with a `payment-required` header
 carrying the x402 terms. With a valid `X-PAYMENT-TX` header it returns **200** and the data.
@@ -18,16 +18,16 @@ carrying the x402 terms. With a valid `X-PAYMENT-TX` header it returns **200** a
 
 ```bash
 # free health check
-curl -s https://d76d5f156d10ef.lhr.life/health
+curl -s https://891bc5312de56e.lhr.life/health
 
 # 402 + terms
-curl -i -X POST https://d76d5f156d10ef.lhr.life/funding \
+curl -i -X POST https://891bc5312de56e.lhr.life/funding \
   -H 'content-type: application/json' \
   -d '{"venue_ids":["binance","bybit","okx"],"markets":["BTC/USDT","ETH/USDT","SOL/USDT"]}'
 
 # pay 0.001 USDC (or native ETH) on Base to 0x8aC6a229f254980CCd3Dd35CF5E1B7c08880B40E,
 # then repeat the request with the transaction hash
-curl -X POST https://d76d5f156d10ef.lhr.life/funding \
+curl -X POST https://891bc5312de56e.lhr.life/funding \
   -H 'content-type: application/json' \
   -H 'x-payment-tx: 0x<tx hash>' \
   -d '{"venue_ids":["binance","bybit"],"markets":["BTC/USDT"]}'
