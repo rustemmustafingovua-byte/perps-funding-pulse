@@ -5,10 +5,14 @@
  *   POST /mcp/paid  — всегда платно: 0.001 USDC или нативный ETH на Base
  *
  * Оба эндпоинта — обычный JSON-RPC 2.0 (streamable HTTP без SSE-стрима,
- * ответ приходит целиком, как в free-web-mcp).
+ * ответ приходит целиком).
  */
+
 import { fundingPulse, VENUES } from "./venues.js"
 import { verifyPayment, paymentTerms, PAY_TO } from "./x402.js"
+import { createKey, revokeKey, listKeys, validateKey } from "./keys.js"
+import { recordUsage, usageFor, ipUsageFor, billingSummary } from "./usage.js"
+import { registerWebhook, unregisterWebhook, listWebhooks } from "./webhooks.js"
 
 const PROTOCOL = "2024-11-05"
 const FREE_LIMIT = Number(process.env.FREE_LIMIT || 20) // запросов в час на IP
@@ -54,6 +58,67 @@ const TOOLS = [
       additionalProperties: false,
     },
   },
+  {
+    name: "create_api_key",
+    description: "Create a new API key for authenticated access. Returns the secret key once.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        owner: { type: "string", description: "Owner label for the key." },
+        tier: { type: "string", enum: ["free", "paid", "enterprise"], description: "Rate limit tier." },
+      },
+      required: ["owner"],
+    },
+  },
+  {
+    name: "revoke_api_key",
+    description: "Revoke an existing API key by id.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "API key id to revoke." },
+      },
+      required: ["id"],
+    },
+  },
+  {
+    name: "list_api_keys",
+    description: "List API keys (ids only, no secrets).",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "get_usage",
+    description: "Get billing summary: total requests, spend, per-key stats.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "register_webhook",
+    description: "Register a webhook URL to receive funding alerts when funding_rate exceeds threshold.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        url: { type: "string", description: "Webhook URL (must be http/https)." },
+        threshold_pct: { type: "number", description: "Minimum absolute funding rate to trigger alert (default 0.01)." },
+      },
+      required: ["url"],
+    },
+  },
+  {
+    name: "unregister_webhook",
+    description: "Remove a webhook by id.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Webhook id to remove." },
+      },
+      required: ["id"],
+    },
+  },
+  {
+    name: "list_webhooks",
+    description: "List registered webhooks.",
+    inputSchema: { type: "object", properties: {} },
+  },
 ]
 
 const rpc = (id, result) => ({ jsonrpc: "2.0", id, result })
@@ -66,7 +131,7 @@ export async function handleMcp({ body, ip, paid }) {
     return rpc(id, {
       protocolVersion: PROTOCOL,
       capabilities: { tools: {} },
-      serverInfo: { name: "perps-funding-pulse", version: "0.1.0" },
+      serverInfo: { name: "perps-funding-pulse", version: "0.2.0" },
     })
   }
   if (method === "tools/list") return rpc(id, { tools: TOOLS })
@@ -74,15 +139,59 @@ export async function handleMcp({ body, ip, paid }) {
   if (method !== "tools/call") return rpcErr(id, -32601, `method not found: ${method}`)
 
   const name = params?.name
-  if (name !== "get_funding") return rpcErr(id, -32602, `unknown tool: ${name}`)
 
-  const rows = await fundingPulse({
-    venue_ids: params?.arguments?.venue_ids,
-    markets: params?.arguments?.markets,
-  })
+  if (name === "get_funding") {
+    const rows = await fundingPulse({
+      venue_ids: params?.arguments?.venue_ids,
+      markets: params?.arguments?.markets,
+    })
+    const text = JSON.stringify({ service: "perps-funding-pulse", results: rows, ts: new Date().toISOString() }, null, 1)
+    return rpc(id, { content: [{ type: "text", text }], isError: false })
+  }
 
-  const text = JSON.stringify({ service: "perps-funding-pulse", results: rows, ts: new Date().toISOString() }, null, 1)
-  return rpc(id, { content: [{ type: "text", text }], isError: false })
+  if (name === "create_api_key") {
+    const owner = String(params?.arguments?.owner || "anonymous")
+    const tier = ["free", "paid", "enterprise"].includes(params?.arguments?.tier) ? params?.arguments?.tier : "free"
+    const rec = createKey({ owner, tier })
+    return rpc(id, { content: [{ type: "text", text: JSON.stringify(rec) }], isError: false })
+  }
+
+  if (name === "revoke_api_key") {
+    const keyId = String(params?.arguments?.id || "")
+    const ok = revokeKey(keyId)
+    return rpc(id, { content: [{ type: "text", text: JSON.stringify({ ok }) }], isError: !ok })
+  }
+
+  if (name === "list_api_keys") {
+    return rpc(id, { content: [{ type: "text", text: JSON.stringify({ keys: listKeys() }) }], isError: false })
+  }
+
+  if (name === "get_usage") {
+    const summary = billingSummary()
+    return rpc(id, { content: [{ type: "text", text: JSON.stringify(summary) }], isError: false })
+  }
+
+  if (name === "register_webhook") {
+    const url = String(params?.arguments?.url || "")
+    const thresholdPct = Number(params?.arguments?.threshold_pct ?? 0.01)
+    if (!/^https?:\/\//i.test(url)) {
+      return rpcErr(id, -32602, "invalid webhook url")
+    }
+    const rec = registerWebhook({ url, thresholdPct })
+    return rpc(id, { content: [{ type: "text", text: JSON.stringify(rec) }], isError: false })
+  }
+
+  if (name === "unregister_webhook") {
+    const webhookId = String(params?.arguments?.id || "")
+    const ok = unregisterWebhook(webhookId)
+    return rpc(id, { content: [{ type: "text", text: JSON.stringify({ ok }) }], isError: !ok })
+  }
+
+  if (name === "list_webhooks") {
+    return rpc(id, { content: [{ type: "text", text: JSON.stringify({ webhooks: listWebhooks() }) }], isError: false })
+  }
+
+  return rpcErr(id, -32602, `unknown tool: ${name}`)
 }
 
 /** Обработка платного MCP-запроса: без оплаты — 402 с условиями. */

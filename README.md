@@ -6,12 +6,91 @@ Bounty submission for [daydreamsai/agent-bounties#8 — Perps Funding Pulse](htt
 
 ---
 
+## Monetization features
+
+### API key management
+
+```bash
+# Create a key (free / paid / enterprise)
+curl -X POST https://perps-funding-pulse.lhr.life/keys \
+  -H 'content-type: application/json' \
+  -d '{"owner":"my-bot","tier":"paid"}'
+
+# List keys (no secrets exposed)
+curl https://perps-funding-pulse.lhr.life/keys
+
+# Revoke a key
+curl -X DELETE https://perps-funding-pulse.lhr.life/keys/<id>
+```
+
+Use the key in requests with `X-API-Key: pfp_<id>_<secret>`.
+
+### Rate limiting tiers
+
+| Tier | Limit | How to use |
+|---|---|---|
+| free | 20/hour per IP | no key needed |
+| paid | 200/hour per key | API key |
+| enterprise | 1,000/hour per key | API key |
+
+### Usage tracking and billing
+
+```bash
+curl https://perps-funding-pulse.lhr.life/usage
+```
+
+Returns total requests, spend in USD, and per-key stats.
+
+### Webhook support for funding alerts
+
+```bash
+# Register a webhook
+curl -X POST https://perps-funding-pulse.lhr.life/webhooks \
+  -H 'content-type: application/json' \
+  -H 'x-api-key: <your key>' \
+  -d '{"url":"https://your-site.com/hook","threshold_pct":0.01}'
+
+# List / delete
+curl https://perps-funding-pulse.lhr.life/webhooks
+curl -X DELETE https://perps-funding-pulse.lhr.life/webhooks/<id>
+```
+
+Webhook payload example:
+
+```json
+{
+  "event": "funding_alert",
+  "ts": "2025-01-01T00:00:00.000Z",
+  "venue": "binance",
+  "market": "BTC/USDT",
+  "funding_rate": 0.05,
+  "threshold_pct": 0.01
+}
+```
+
+### MCP tools (monetization)
+
+The MCP endpoint now exposes tools for key management, usage, and webhooks:
+
+- `create_api_key`
+- `revoke_api_key`
+- `list_api_keys`
+- `get_usage`
+- `register_webhook`
+- `unregister_webhook`
+- `list_webhooks`
+
+---
+
 ## Live deployment
 
 | Endpoint | Method | Payment |
 |---|---|---|
 | `https://925ccb16381883.lhr.life/health` | GET | free |
 | `https://925ccb16381883.lhr.life/funding` | POST | x402 — 0.001 USDC **or** native ETH on Base |
+| `https://925ccb16381883.lhr.life/keys` | POST/GET/DELETE | free (API keys) |
+| `https://925ccb16381883.lhr.life/usage` | GET | free |
+| `https://925ccb16381883.lhr.life/webhooks` | POST/GET/DELETE | requires `X-API-Key` |
 
 ```bash
 # 1) health — бесплатно
@@ -107,8 +186,9 @@ PORT=8780 PRICE_USD=0.001 X402_PAY_TO=0xYourAddress npm start
 npm test
 ```
 
-6 tests: venue normalisation, resilience to a dead venue, x402 terms shape, and two
-negative payment-verification cases.
+27 tests: venue normalisation, resilience to a dead venue, x402 terms shape, two
+negative payment-verification cases, API key lifecycle, usage tracking,
+webhook registration, and MCP monetization tools.
 
 ## Payment address (Solana)
 
