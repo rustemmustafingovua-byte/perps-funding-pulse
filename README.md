@@ -10,6 +10,14 @@ Bounty submission for [daydreamsai/agent-bounties#8 — Perps Funding Pulse](htt
 
 ### API key management
 
+## Quick Start
+
+```bash
+git clone https://github.com/rustemmustafingovua-byte/perps-funding-pulse.git
+cd perps-funding-pulse && npm install
+PORT=8780 PRICE_USD=0.001 X402_PAY_TO=0x8aC6a229f254980CCd3Dd35CF5E1B7c08880B40E npm start
+```
+
 ```bash
 # Create a key (free / paid / enterprise)
 curl -X POST https://perps-funding-pulse.lhr.life/keys \
@@ -28,7 +36,10 @@ Use the key in requests with `X-API-Key: pfp_<id>_<secret>`.
 ### Rate limiting tiers
 
 | Tier | Limit | How to use |
-|---|---|---|
+|
+
+⭐ **Star us on GitHub** — it helps others find the project.
+---|---|---|
 | free | 20/hour per IP | no key needed |
 | paid | 200/hour per key | API key |
 | enterprise | 1,000/hour per key | API key |

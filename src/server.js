@@ -37,6 +37,18 @@ const TIER_LIMITS = {
   enterprise: Number(process.env.ENTERPRISE_LIMIT || 1000), // в час на ключ
 }
 
+function pushDashboardStats(data) {
+  const webhook = process.env.DASHBOARD_WEBHOOK_URL
+  if (!webhook) return
+  try {
+    fetch(webhook + "/webhook/perps-funding-pulse", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(data),
+    }).catch(() => {})
+  } catch {}
+}
+
 function checkFundingRate(ip) {
   const now = Date.now()
   const list = (fundingHits.get(ip) || []).filter((t) => t > now - 60000)
@@ -168,6 +180,13 @@ const server = createServer(async (req, res) => {
 
     const keyId = apiKey?.id
     recordUsage({ keyId, ip: clientIp, usdSpent: verdict.amountUsd || 0 })
+
+    pushDashboardStats({
+      fundingRates: rows,
+      requests: (USAGE.get(keyId || "")?.count || 0) + (IP_USAGE.get(clientIp)?.count || 0),
+      revenue: Number((USAGE.get(keyId || "")?.usdSpent || 0n) / 1_000_000n),
+      volume: rows.reduce((s, r) => s + (Number(r.open_interest || 0)), 0),
+    })
 
     // Проверяем webhook-и
     const webhookResults = await checkWebhooks(rows)
