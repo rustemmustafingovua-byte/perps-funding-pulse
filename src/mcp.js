@@ -24,6 +24,11 @@ export function freeTier(ip) {
     return { allowed: true, left: FREE_LIMIT - 1 }
   }
   rec.count += 1
+  if (hits.size > 10000) {
+    for (const [k, v] of hits) {
+      if (now - v.at > 3_600_000) hits.delete(k)
+    }
+  }
   return { allowed: rec.count <= FREE_LIMIT, left: Math.max(0, FREE_LIMIT - rec.count) }
 }
 

@@ -15,10 +15,33 @@ import { handleMcp, handlePaidMcp, freeTier, FREE_LIMIT } from "./mcp.js"
 const PORT = Number(process.env.PORT || 8780)
 const PRICE_USD = Number(process.env.PRICE_USD || "0.001")
 const VERSION = "0.1.0"
+const FUNDING_RPM = Number(process.env.FUNDING_RPM || "30")
+const fundingHits = new Map()
+
+function checkFundingRate(ip) {
+  const now = Date.now()
+  const list = (fundingHits.get(ip) || []).filter(t => t > now - 60000)
+  if (list.length >= FUNDING_RPM) {
+    fundingHits.set(ip, list)
+    return false
+  }
+  list.push(now)
+  fundingHits.set(ip, list)
+  if (fundingHits.size > 10000) {
+    for (const [k, v] of fundingHits) {
+      if (!v.some(t => t > now - 60000)) fundingHits.delete(k)
+    }
+  }
+  return true
+}
 
 const json = (res, status, body, headers = {}) => {
   res.writeHead(status, { "content-type": "application/json", "access-control-allow-origin": "*", ...headers })
   res.end(JSON.stringify(body))
+}
+
+function getClientIp(req) {
+  return (req.headers["x-forwarded-for"]?.split(",")[0]?.trim()) || req.socket.remoteAddress || "unknown"
 }
 
 const server = createServer(async (req, res) => {
@@ -42,6 +65,10 @@ const server = createServer(async (req, res) => {
   }
 
   if (req.method === "POST" && url.pathname === "/funding") {
+    const clientIp = getClientIp(req)
+    if (!checkFundingRate(clientIp)) {
+      return json(res, 429, { error: "rate_limit_exceeded", retryAfter: 60 })
+    }
     const txHash = req.headers["x-payment-tx"]
     if (!txHash) {
       const terms = await paymentTerms(PRICE_USD)
@@ -115,7 +142,7 @@ const server = createServer(async (req, res) => {
       const out = await handlePaidMcp({ body, txHash: req.headers["x-payment-tx"] })
       return json(res, out.status, out.body, out.headers)
     }
-    const ip = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.socket.remoteAddress || "unknown"
+    const ip = getClientIp(req)
     const tier = freeTier(ip)
     if (!tier.allowed) {
       const terms = await paymentTerms(PRICE_USD)
