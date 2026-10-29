@@ -1,16 +1,12 @@
 /**
- * API key management for perps-funding-pulse.
- *
- *   POST /keys      — создать ключ (owner, tier)
- *   DELETE /keys/:id — отозвать ключ
- *   GET  /keys       — список ключей (без значений)
- *
- * Хранилище в памяти. Для продакшена можно заменить на БД.
+ * API keys. The full secret is returned once from createKey and is never listed.
+ * A key id by itself is not enough: validateKey checks the secret.
  */
-
 import { randomBytes } from "node:crypto"
+import { initStore, save, snapshot } from "./store.js"
+import { safeEqual } from "./secret.js"
 
-const KEYS = new Map() // id -> { id, key, owner, tier, createdAt, revoked }
+const TIERS = new Set(["free", "paid", "enterprise"])
 
 function generateKeyId() {
   return randomBytes(8).toString("hex")
@@ -21,46 +17,52 @@ function generateSecret() {
 }
 
 export function createKey({ owner = "anonymous", tier = "free" } = {}) {
+  initStore()
   const id = generateKeyId()
   const secret = generateSecret()
   const record = {
     id,
     key: `pfp_${id}_${secret}`,
-    owner,
-    tier, // 'free' | 'paid' | 'enterprise'
+    owner: String(owner).slice(0, 128),
+    tier: TIERS.has(tier) ? tier : "free",
     createdAt: Date.now(),
     revoked: false,
   }
-  KEYS.set(id, record)
+  snapshot().keys.push(record)
+  save()
   return { ...record }
 }
 
 export function revokeKey(id) {
-  const rec = KEYS.get(id)
+  const rec = snapshot().keys.find((row) => row.id === id)
   if (!rec) return false
   rec.revoked = true
+  save()
   return true
 }
 
 export function getKey(id) {
-  return KEYS.get(id) || null
+  return snapshot().keys.find((row) => row.id === id) || null
 }
 
 export function listKeys() {
-  return Array.from(KEYS.values()).map(({ key, ...rest }) => rest)
+  return snapshot().keys.map(({ key: _secret, ...rest }) => ({ ...rest }))
 }
 
 export function validateKey(raw) {
   if (!raw || typeof raw !== "string") return null
-  const first = raw.indexOf("_")
-  const second = raw.indexOf("_", first + 1)
-  if (first < 0 || second < 0 || raw.slice(0, first) !== "pfp") return null
-  const id = raw.slice(first + 1, second)
-  const rec = KEYS.get(id)
+  const match = /^pfp_([0-9a-f]{16})_(.+)$/.exec(raw)
+  if (!match) return null
+  const rec = snapshot().keys.find((row) => row.id === match[1])
   if (!rec || rec.revoked) return null
+  const prefix = `pfp_${rec.id}_`
+  if (!rec.key.startsWith(prefix)) return null
+  if (!safeEqual(match[2], rec.key.slice(prefix.length))) return null
   return rec
 }
 
 export function __clearKeys() {
-  KEYS.clear()
+  initStore()
+  snapshot().keys.splice(0, snapshot().keys.length)
+  save()
 }

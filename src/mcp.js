@@ -1,46 +1,43 @@
 /**
- * MCP-обёртка над perps-funding-pulse.
- *
- *   POST /mcp       — бесплатный тариф (лимит запросов в час на IP)
- *   POST /mcp/paid  — всегда платно: 0.001 USDC или нативный ETH на Base
- *
- * Оба эндпоинта — обычный JSON-RPC 2.0 (streamable HTTP без SSE-стрима,
- * ответ приходит целиком).
+ * MCP wrapper. POST /mcp is a free preview. POST /mcp/paid settles x402 on every call.
+ * Key and webhook tools act only on the API key the caller presents.
  */
-
 import { fundingPulse, VENUES } from "./venues.js"
-import { verifyPayment, paymentTerms, PAY_TO } from "./x402.js"
+import { acceptPayment, paymentTerms } from "./x402.js"
 import { createKey, revokeKey, listKeys, validateKey } from "./keys.js"
-import { recordUsage, usageFor, ipUsageFor, billingSummary } from "./usage.js"
+import { usageFor } from "./usage.js"
 import { registerWebhook, unregisterWebhook, listWebhooks } from "./webhooks.js"
+import { VERSION, freeLimit, priceUsd } from "./config.js"
 
 const PROTOCOL = "2024-11-05"
-const FREE_LIMIT = Number(process.env.FREE_LIMIT || 20) // запросов в час на IP
-const PRICE_USD = Number(process.env.PRICE_USD || "0.001")
-
-const hits = new Map() // ip -> { count, at }
+const hits = new Map()
 
 export function freeTier(ip) {
+  const limit = freeLimit()
   const now = Date.now()
   const rec = hits.get(ip)
   if (!rec || now - rec.at > 3_600_000) {
     hits.set(ip, { count: 1, at: now })
-    return { allowed: true, left: FREE_LIMIT - 1 }
+    return { allowed: true, left: Math.max(0, limit - 1) }
   }
   rec.count += 1
   if (hits.size > 10000) {
-    for (const [k, v] of hits) {
-      if (now - v.at > 3_600_000) hits.delete(k)
+    for (const [key, value] of hits) {
+      if (now - value.at > 3_600_000) hits.delete(key)
     }
   }
-  return { allowed: rec.count <= FREE_LIMIT, left: Math.max(0, FREE_LIMIT - rec.count) }
+  return { allowed: rec.count <= limit, left: Math.max(0, limit - rec.count) }
+}
+
+export function __resetMcpFreeTier() {
+  hits.clear()
 }
 
 const TOOLS = [
   {
     name: "get_funding",
     description:
-      "Live funding rate, time to the next funding tick, open interest, long/short skew and mark price for perpetual futures markets (Binance USDⓈ-M, Bybit linear, OKX swaps).",
+      "Live funding rate, time to the next funding tick, open interest, long/short skew and mark price for perpetual futures (Binance USD-M, Bybit linear, OKX swaps).",
     inputSchema: {
       type: "object",
       properties: {
@@ -52,7 +49,7 @@ const TOOLS = [
         markets: {
           type: "array",
           items: { type: "string" },
-          description: "Markets to track, e.g. BTC/USDT, ETH/USDT, SOL/USDT (OKX: BTC-USDT-SWAP). Default: venue default set.",
+          description: "Markets, e.g. BTC/USDT. The same symbol is normalized per venue. Default: the venue's default set.",
         },
       },
       additionalProperties: false,
@@ -60,78 +57,98 @@ const TOOLS = [
   },
   {
     name: "create_api_key",
-    description: "Create a new API key for authenticated access. Returns the secret key once.",
+    description: "Create a free-tier API key. Paid and enterprise keys are issued by the operator.",
     inputSchema: {
       type: "object",
       properties: {
-        owner: { type: "string", description: "Owner label for the key." },
-        tier: { type: "string", enum: ["free", "paid", "enterprise"], description: "Rate limit tier." },
+        owner: { type: "string", description: "Label stored with the key." },
       },
       required: ["owner"],
     },
   },
   {
     name: "revoke_api_key",
-    description: "Revoke an existing API key by id.",
+    description: "Revoke one of your API keys. Requires the key secret and the key id.",
     inputSchema: {
       type: "object",
       properties: {
-        id: { type: "string", description: "API key id to revoke." },
+        api_key: { type: "string" },
+        id: { type: "string" },
       },
-      required: ["id"],
+      required: ["api_key", "id"],
     },
   },
   {
     name: "list_api_keys",
-    description: "List API keys (ids only, no secrets).",
-    inputSchema: { type: "object", properties: {} },
+    description: "Show the metadata for the API key you present. The secret is not returned.",
+    inputSchema: {
+      type: "object",
+      properties: { api_key: { type: "string" } },
+      required: ["api_key"],
+    },
   },
   {
     name: "get_usage",
-    description: "Get billing summary: total requests, spend, per-key stats.",
-    inputSchema: { type: "object", properties: {} },
+    description: "Usage and spend for the API key you present.",
+    inputSchema: {
+      type: "object",
+      properties: { api_key: { type: "string" } },
+      required: ["api_key"],
+    },
   },
   {
     name: "register_webhook",
-    description: "Register a webhook URL to receive funding alerts when funding_rate exceeds threshold.",
+    description: "Register a public http(s) URL to receive funding alerts for your API key.",
     inputSchema: {
       type: "object",
       properties: {
-        url: { type: "string", description: "Webhook URL (must be http/https)." },
-        threshold_pct: { type: "number", description: "Minimum absolute funding rate to trigger alert (default 0.01)." },
+        api_key: { type: "string" },
+        url: { type: "string" },
+        threshold_pct: { type: "number", description: "Absolute funding rate. 0.0001 means 0.01%." },
       },
-      required: ["url"],
+      required: ["api_key", "url"],
     },
   },
   {
     name: "unregister_webhook",
-    description: "Remove a webhook by id.",
+    description: "Remove one of your webhooks.",
     inputSchema: {
       type: "object",
       properties: {
-        id: { type: "string", description: "Webhook id to remove." },
+        api_key: { type: "string" },
+        id: { type: "string" },
       },
-      required: ["id"],
+      required: ["api_key", "id"],
     },
   },
   {
     name: "list_webhooks",
-    description: "List registered webhooks.",
-    inputSchema: { type: "object", properties: {} },
+    description: "List webhooks owned by your API key.",
+    inputSchema: {
+      type: "object",
+      properties: { api_key: { type: "string" } },
+      required: ["api_key"],
+    },
   },
 ]
 
 const rpc = (id, result) => ({ jsonrpc: "2.0", id, result })
 const rpcErr = (id, code, message) => ({ jsonrpc: "2.0", id, error: { code, message } })
 
-export async function handleMcp({ body, ip, paid }) {
+function requireCaller(params, id) {
+  const rec = validateKey(params?.arguments?.api_key)
+  if (!rec) return { error: rpcErr(id, -32001, "valid api_key required") }
+  return { key: rec }
+}
+
+export async function handleMcp({ body }) {
   const { id = null, method, params = {} } = body ?? {}
 
   if (method === "initialize") {
     return rpc(id, {
       protocolVersion: PROTOCOL,
       capabilities: { tools: {} },
-      serverInfo: { name: "perps-funding-pulse", version: "0.2.0" },
+      serverInfo: { name: "perps-funding-pulse", version: VERSION },
     })
   }
   if (method === "tools/list") return rpc(id, { tools: TOOLS })
@@ -150,75 +167,101 @@ export async function handleMcp({ body, ip, paid }) {
   }
 
   if (name === "create_api_key") {
+    if (params?.arguments?.tier && params.arguments.tier !== "free") {
+      return rpcErr(id, -32602, "paid and enterprise keys are issued with an admin token via POST /keys")
+    }
     const owner = String(params?.arguments?.owner || "anonymous")
-    const tier = ["free", "paid", "enterprise"].includes(params?.arguments?.tier) ? params?.arguments?.tier : "free"
-    const rec = createKey({ owner, tier })
+    const rec = createKey({ owner, tier: "free" })
     return rpc(id, { content: [{ type: "text", text: JSON.stringify(rec) }], isError: false })
   }
 
   if (name === "revoke_api_key") {
+    const caller = requireCaller(params, id)
+    if (caller.error) return caller.error
     const keyId = String(params?.arguments?.id || "")
+    if (caller.key.id !== keyId) return rpcErr(id, -32001, "api_key does not match id")
     const ok = revokeKey(keyId)
     return rpc(id, { content: [{ type: "text", text: JSON.stringify({ ok }) }], isError: !ok })
   }
 
   if (name === "list_api_keys") {
-    return rpc(id, { content: [{ type: "text", text: JSON.stringify({ keys: listKeys() }) }], isError: false })
+    const caller = requireCaller(params, id)
+    if (caller.error) return caller.error
+    const keys = listKeys().filter((row) => row.id === caller.key.id)
+    return rpc(id, { content: [{ type: "text", text: JSON.stringify({ keys }) }], isError: false })
   }
 
   if (name === "get_usage") {
-    const summary = billingSummary()
-    return rpc(id, { content: [{ type: "text", text: JSON.stringify(summary) }], isError: false })
+    const caller = requireCaller(params, id)
+    if (caller.error) return caller.error
+    return rpc(id, { content: [{ type: "text", text: JSON.stringify({ id: caller.key.id, ...usageFor(caller.key.id) }) }], isError: false })
   }
 
   if (name === "register_webhook") {
+    const caller = requireCaller(params, id)
+    if (caller.error) return caller.error
     const url = String(params?.arguments?.url || "")
-    const thresholdPct = Number(params?.arguments?.threshold_pct ?? 0.01)
-    if (!/^https?:\/\//i.test(url)) {
-      return rpcErr(id, -32602, "invalid webhook url")
-    }
-    const rec = registerWebhook({ url, thresholdPct })
+    const thresholdPct = Number(params?.arguments?.threshold_pct ?? 0.0001)
+    const rec = registerWebhook({ url, thresholdPct, ownerKeyId: caller.key.id })
+    if (rec.error) return rpcErr(id, -32602, rec.error)
     return rpc(id, { content: [{ type: "text", text: JSON.stringify(rec) }], isError: false })
   }
 
   if (name === "unregister_webhook") {
+    const caller = requireCaller(params, id)
+    if (caller.error) return caller.error
     const webhookId = String(params?.arguments?.id || "")
-    const ok = unregisterWebhook(webhookId)
+    const ok = unregisterWebhook(webhookId, caller.key.id)
     return rpc(id, { content: [{ type: "text", text: JSON.stringify({ ok }) }], isError: !ok })
   }
 
   if (name === "list_webhooks") {
-    return rpc(id, { content: [{ type: "text", text: JSON.stringify({ webhooks: listWebhooks() }) }], isError: false })
+    const caller = requireCaller(params, id)
+    if (caller.error) return caller.error
+    return rpc(id, { content: [{ type: "text", text: JSON.stringify({ webhooks: listWebhooks(caller.key.id) }) }], isError: false })
   }
 
   return rpcErr(id, -32602, `unknown tool: ${name}`)
 }
 
-/** Обработка платного MCP-запроса: без оплаты — 402 с условиями. */
-export async function handlePaidMcp({ body, txHash }) {
-  if (!txHash) {
-    const terms = await paymentTerms(PRICE_USD)
+export async function handlePaidMcp({ body, txHash, signature, resource, beforeSettle, fetchImpl }) {
+  const outcome = await acceptPayment({
+    txHash,
+    signature,
+    priceUsd: priceUsd(),
+    resource,
+    fetchImpl,
+    beforeSettle,
+  })
+  if (!outcome.ok) {
+    let terms = null
+    try {
+      terms = await paymentTerms(priceUsd(), { resource, fetchImpl })
+    } catch {
+      terms = null
+    }
+    const headers = {}
+    if (terms) headers["payment-required"] = Buffer.from(JSON.stringify(terms)).toString("base64")
+    const error = outcome.status === 400 ? "invalid_payment" : outcome.status === 429 ? "rate_limit_exceeded" : "payment_required"
     return {
-      status: 402,
-      body: {
-        error: "payment_required",
-        message: `payment required: ${PRICE_USD} USDC on Base`,
-        terms,
-      },
-      headers: { "payment-required": Buffer.from(JSON.stringify(terms)).toString("base64") },
+      status: outcome.status || 402,
+      body: { error, reason: outcome.reason, ...(terms ? { terms } : {}) },
+      headers,
     }
   }
-  const verdict = await verifyPayment(txHash, { priceUsd: PRICE_USD })
-  if (!verdict.ok) {
-    const terms = await paymentTerms(PRICE_USD)
-    return {
-      status: 402,
-      body: { error: "payment_required", reason: verdict.reason, terms },
-      headers: { "payment-required": Buffer.from(JSON.stringify(terms)).toString("base64") },
-    }
+  const result = await handleMcp({ body, ip: "paid", paid: true })
+  return {
+    status: 200,
+    body: result,
+    headers: {
+      "payment-response": Buffer.from(JSON.stringify({
+        success: true,
+        transaction: outcome.tx || "",
+        network: "eip155:8453",
+        payer: outcome.payer || null,
+      })).toString("base64"),
+    },
   }
-  const res = await handleMcp({ body, ip: "paid", paid: true })
-  return { status: 200, body: res, headers: {} }
 }
 
-export { PAY_TO, PRICE_USD, FREE_LIMIT }
+export { priceUsd as PRICE_USD, freeLimit as FREE_LIMIT }

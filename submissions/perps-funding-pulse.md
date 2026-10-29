@@ -1,33 +1,35 @@
 # Submission: Perps Funding Pulse — Bounty #8
 
 **Related issue:** [#8 — Perps Funding Pulse](https://github.com/daydreamsai/agent-bounties/issues/8)
-**Agent:** `perps-funding-pulse` v0.1.0
+**Agent:** `perps-funding-pulse` v0.3.0
 **Repo:** https://github.com/rustemmustafingovua-byte/perps-funding-pulse
 
-## Live deployment
+## Deployment
+
+Host it yourself (Docker or Render). The receiving address is `X402_PAY_TO`. There is no built-in payee.
 
 | Endpoint | Method | Payment |
 |---|---|---|
-| `https://925ccb16381883.lhr.life/health` | GET | free |
-| `https://925ccb16381883.lhr.life/funding` | POST | x402 — 0.001 USDC **or** native ETH on Base |
+| `GET /health` | GET | free |
+| `POST /funding` | POST | x402 — `PRICE_USD` (default 0.001) USDC **or** native ETH on Base |
 
-`POST /funding` without payment returns **HTTP 402** with a `payment-required` header
-carrying the x402 terms. With a valid `X-PAYMENT-TX` header it returns **200** and the data.
+`POST /funding` after the free hourly preview returns **HTTP 402** with a `PAYMENT-REQUIRED` header
+carrying the x402 terms. With a valid unused `X-PAYMENT-TX` header it returns **200** and the data.
 
 ### How to verify the payment path
 
 ```bash
 # free health check
-curl -s https://925ccb16381883.lhr.life/health
+curl -s http://127.0.0.1:8780/health
 
-# 402 + terms
-curl -i -X POST https://925ccb16381883.lhr.life/funding \
+# 402 + terms, once the free preview for this IP is used
+curl -i -X POST http://127.0.0.1:8780/funding \
   -H 'content-type: application/json' \
   -d '{"venue_ids":["binance","bybit","okx"],"markets":["BTC/USDT","ETH/USDT","SOL/USDT"]}'
 
-# pay 0.001 USDC (or native ETH) on Base to 0x8aC6a229f254980CCd3Dd35CF5E1B7c08880B40E,
+# pay 0.001 USDC (or native ETH) on Base to the address in X402_PAY_TO,
 # then repeat the request with the transaction hash
-curl -X POST https://925ccb16381883.lhr.life/funding \
+curl -X POST http://127.0.0.1:8780/funding \
   -H 'content-type: application/json' \
   -H 'x-payment-tx: 0x<tx hash>' \
   -d '{"venue_ids":["binance","bybit"],"markets":["BTC/USDT"]}'

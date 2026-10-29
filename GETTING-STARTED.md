@@ -1,38 +1,27 @@
-# Perps Funding Pulse — Быстрый старт
+# Getting started
 
-## Что это
-Real-time трекер funding rate для perpetual futures на Base.
+Perps Funding Pulse is an HTTP API. It does not serve a web page or a websocket.
 
-## Установка (1 минута)
 ```bash
-cd /tmp/perps-funding-pulse
-npm install
+npm ci
+cp .env.example .env
 ```
 
-## Запуск (2 минуты)
+Set `X402_PAY_TO` in `.env` to the Base address that should receive USDC and ETH, then:
+
 ```bash
 npm start
-# Сервис запущен на http://localhost:3000
 ```
 
-## Использование
-- Открой http://localhost:3000 — увидишь funding rates
-- API: `GET /api/funding` — JSON с текущими rates
-- WebSocket:实时 更新
+- `GET http://127.0.0.1:8780/health` — free status
+- `POST http://127.0.0.1:8780/funding` — funding rates. The first calls in an hour are free; after that the response is 402 until the caller pays
 
-## x402 монетизация
-- Бесплатные endpoints: `/api/public/*`
-- Платные: `/api/funding` (100 LMN), `/api/alerts` (50 LMN)
+Pay by sending USDC or ETH on Base to `X402_PAY_TO` and retrying with header `X-PAYMENT-TX: 0x<transaction hash>`.
 
-## Документация
-- README.md — полное описание
-- test/ — 27 тестов
+Pricing, API keys, webhooks, and Docker/Render deploy steps are in [README.md](./README.md).
 
-## Следующие шаги
-1. Добавь токены в `.env`
-2. Настрой webhook для алертов
-3. Интегрируй с lumen-chain x402
+```bash
+npm test
+```
 
-## Troubleshooting
-- Port 3000 занят? → `PORT=3001 npm start`
-- Tests fail? → `npm install` заново
+Tests do not need a wallet, an API key, or network access.

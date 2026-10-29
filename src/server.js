@@ -1,313 +1,553 @@
 /**
- * perps-funding-pulse — агент с публичными данными по перпетуалам, доступный по x402.
+ * perps-funding-pulse
  *
- *   GET  /health         — бесплатно: статус, площадки, время ответа
- *   POST /funding        — платно (x402): фандинг, время до тика, открытый интерес, перекос
- *   POST /mcp            — бесплатный MCP (лимит 20/час на IP)
- *   POST /mcp/paid       — платный MCP (x402)
- *   POST /keys           — создать API-ключ
- *   DELETE /keys/:id     — отозвать API-ключ
- *   GET  /keys           — список ключей
- *   GET  /usage          — сводка по использованию и биллингу
- *   POST /webhooks       — регистрация webhook на алерты фандинга
- *   DELETE /webhooks/:id — удалить webhook
- *   GET  /webhooks       — список webhook-ов
- *
- * Оплата: клиент переводит USDC или нативный ETH на адрес получателя и присылает
- * хеш транзакции в X-PAYMENT-TX. Газ платит клиент, сервер ничего не тратит.
+ *   GET    /health          free status
+ *   POST   /funding         free hourly preview, then USDC or ETH per call on Base
+ *   POST   /mcp             free MCP preview
+ *   POST   /mcp/paid        MCP settled with x402 on every call
+ *   POST   /keys            create a free key; paid and enterprise need X-Admin-Token
+ *   GET    /keys            admin: key metadata, never secrets
+ *   DELETE /keys/:id        the key holder or an admin
+ *   GET    /usage           admin billing summary
+ *   POST   /webhooks        API key required; public URLs only
+ *   GET    /webhooks
+ *   DELETE /webhooks/:id
  */
 import { createServer } from "node:http"
+import { pathToFileURL } from "node:url"
 import { fundingPulse, VENUES } from "./venues.js"
-import { verifyPayment, paymentTerms, PAY_TO } from "./x402.js"
-import { handleMcp, handlePaidMcp, freeTier, FREE_LIMIT } from "./mcp.js"
+import { acceptPayment, facilitatorUrl, payToAddress, paymentTerms } from "./x402.js"
+import { handleMcp, handlePaidMcp, freeTier } from "./mcp.js"
 import { createKey, revokeKey, listKeys, validateKey } from "./keys.js"
-import { recordUsage, usageFor, ipUsageFor, billingSummary } from "./usage.js"
-import { registerWebhook, unregisterWebhook, listWebhooks, checkWebhooks } from "./webhooks.js"
+import {
+  billingSummary,
+  enterpriseQuotaId,
+  freeQuotaId,
+  ipUsageFor,
+  paidQuotaId,
+  peekQuota,
+  recordUsage,
+  tryConsume,
+  usageFor,
+} from "./usage.js"
+import { checkWebhooks, listWebhooks, registerWebhook, unregisterWebhook } from "./webhooks.js"
+import { initStore } from "./store.js"
+import { safeEqual } from "./secret.js"
+import {
+  VERSION,
+  enterpriseLimit,
+  freeLimit,
+  fundingRpm,
+  paidLimit,
+  port,
+  priceUsd,
+} from "./config.js"
 
-const PORT = Number(process.env.PORT || 8780)
-const PRICE_USD = Number(process.env.PRICE_USD || "0.001")
-const VERSION = "0.2.0"
-const FUNDING_RPM = Number(process.env.FUNDING_RPM || "30")
+const BODY_LIMIT = 65_536
 const fundingHits = new Map()
 
-// Лимиты по тарифам
-const TIER_LIMITS = {
-  free: Number(process.env.FREE_LIMIT || 20), // в час на IP
-  paid: Number(process.env.PAID_LIMIT || 200), // в час на ключ
-  enterprise: Number(process.env.ENTERPRISE_LIMIT || 1000), // в час на ключ
+function json(res, status, body, headers = {}) {
+  const payload = JSON.stringify(body)
+  res.writeHead(status, {
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store",
+    "access-control-allow-origin": "*",
+    "access-control-expose-headers": "payment-required, payment-response",
+    ...headers,
+  })
+  res.end(payload)
 }
 
-function pushDashboardStats(data) {
-  const webhook = process.env.DASHBOARD_WEBHOOK_URL
-  if (!webhook) return
-  try {
-    fetch(webhook + "/webhook/perps-funding-pulse", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(data),
-    }).catch(() => {})
-  } catch {}
+function clientIp(req) {
+  if (process.env.TRUST_PROXY === "1") {
+    const forwarded = req.headers["x-forwarded-for"]
+    const first = Array.isArray(forwarded) ? forwarded[0] : forwarded
+    if (first) return String(first).split(",")[0].trim()
+  }
+  return req.socket.remoteAddress || "unknown"
 }
 
-function checkFundingRate(ip) {
+function headerOne(req, name) {
+  const value = req.headers[name]
+  if (Array.isArray(value)) return value[0] || ""
+  return value || ""
+}
+
+function adminOk(req) {
+  const expected = process.env.ADMIN_TOKEN
+  const presented = headerOne(req, "x-admin-token")
+  if (!expected || !presented) return false
+  return safeEqual(presented, expected)
+}
+
+function allowBurst(ip) {
   const now = Date.now()
-  const list = (fundingHits.get(ip) || []).filter((t) => t > now - 60000)
-  if (list.length >= FUNDING_RPM) {
+  const limit = Math.max(1, fundingRpm())
+  const list = (fundingHits.get(ip) || []).filter((stamp) => stamp > now - 60_000)
+  if (list.length >= limit) {
     fundingHits.set(ip, list)
     return false
   }
   list.push(now)
   fundingHits.set(ip, list)
-  if (fundingHits.size > 10000) {
-    for (const [k, v] of fundingHits) {
-      if (!v.some((t) => t > now - 60000)) fundingHits.delete(k)
+  if (fundingHits.size > 10_000) {
+    for (const [key, stamps] of fundingHits) {
+      if (!stamps.some((stamp) => stamp > now - 60_000)) fundingHits.delete(key)
     }
   }
   return true
 }
 
-const json = (res, status, body, headers = {}) => {
-  res.writeHead(status, { "content-type": "application/json", "access-control-allow-origin": "*", ...headers })
-  res.end(JSON.stringify(body))
-}
-
-function getClientIp(req) {
-  return (req.headers["x-forwarded-for"]?.split(",")[0]?.trim()) || req.socket.remoteAddress || "unknown"
-}
-
-async function requireApiKey(req) {
-  const raw = req.headers["x-api-key"]
-  const rec = validateKey(raw)
-  if (!rec) return null
-  return rec
-}
-
-async function checkKeyRateLimit(key) {
-  const now = Date.now()
-  const limit = TIER_LIMITS[key.tier] ?? TIER_LIMITS.free
-  const usage = usageFor(key.id)
-  if (!usage.lastAt || now - usage.lastAt > 3_600_000) {
-    return { allowed: true, limit, remaining: limit - 1, used: 1 }
+function resourceOf(req, url) {
+  const host = req.headers["x-forwarded-host"] || req.headers.host || "localhost"
+  const proto = process.env.TRUST_PROXY === "1"
+    ? (headerOne(req, "x-forwarded-proto") || "https")
+    : "http"
+  return {
+    url: `${proto}://${host}${url.pathname}`,
+    description: "Live perpetual futures funding rates, next funding time, and open interest",
+    mimeType: "application/json",
   }
-  const used = usage.count + 1
-  return { allowed: used <= limit, limit, remaining: Math.max(0, limit - used), used }
 }
 
-const server = createServer(async (req, res) => {
-  res.setHeader("access-control-allow-origin", "*")
-  res.setHeader("access-control-allow-headers", "content-type, x-payment-tx, x-api-key")
-  if (req.method === "OPTIONS") return res.writeHead(204).end()
+async function readJson(req) {
+  const declared = Number(req.headers["content-length"] || 0)
+  if (declared > BODY_LIMIT) {
+    const error = new Error("body_too_large")
+    error.code = "BODY_TOO_LARGE"
+    throw error
+  }
+  const chunks = []
+  let size = 0
+  for await (const chunk of req) {
+    size += chunk.length
+    if (size > BODY_LIMIT) {
+      const error = new Error("body_too_large")
+      error.code = "BODY_TOO_LARGE"
+      throw error
+    }
+    chunks.push(chunk)
+  }
+  const text = Buffer.concat(chunks).toString() || "{}"
+  return JSON.parse(text)
+}
 
-  const url = new URL(req.url, `http://${req.headers.host || "localhost"}`)
+function stringList(value, max) {
+  if (value == null) return undefined
+  if (!Array.isArray(value)) {
+    const error = new Error("invalid_list")
+    error.code = "INVALID_LIST"
+    throw error
+  }
+  return value.slice(0, max).map((item) => {
+    if (typeof item !== "string" || item.trim() === "") {
+      const error = new Error("invalid_list")
+      error.code = "INVALID_LIST"
+      throw error
+    }
+    return item.trim().slice(0, 40)
+  })
+}
 
-  if (req.method === "GET" && url.pathname === "/health") {
-    return json(res, 200, {
-      status: "ok",
-      service: "perps-funding-pulse",
-      version: VERSION,
-      venues: Object.entries(VENUES).map(([id, v]) => ({ id, name: v.name, markets: v.markets })),
-      price_usd: PRICE_USD,
-      pay_to: PAY_TO,
-      network: "base",
-      ts: new Date().toISOString(),
+function paymentResponseHeader(outcome) {
+  return Buffer.from(JSON.stringify({
+    success: true,
+    transaction: outcome.tx || "",
+    network: "eip155:8453",
+    payer: outcome.payer || null,
+  })).toString("base64")
+}
+
+async function sendPaymentRequired(res, { reason, resource }) {
+  try {
+    const terms = await paymentTerms(priceUsd(), { resource })
+    return json(res, 402, {
+      error: "payment_required",
+      reason: reason || "payment_required",
+      message: `Send ${priceUsd()} USD of USDC or ETH on Base to ${terms.accepts[0].payTo}, then retry with X-PAYMENT-TX. x402 clients retry with PAYMENT-SIGNATURE.`,
+      terms,
+    }, {
+      "payment-required": Buffer.from(JSON.stringify(terms)).toString("base64"),
+    })
+  } catch (error) {
+    if (error?.code === "PAYEE_NOT_CONFIGURED") {
+      return json(res, 503, {
+        error: "payee_not_configured",
+        message: "Set X402_PAY_TO to the Base address that should receive USDC and ETH.",
+      })
+    }
+    throw error
+  }
+}
+
+function pushDashboardStats(data) {
+  const webhook = process.env.DASHBOARD_WEBHOOK_URL
+  if (!webhook) return
+  const target = `${webhook.replace(/\/$/, "")}/webhook/perps-funding-pulse`
+  fetch(target, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(data),
+    redirect: "error",
+    signal: AbortSignal.timeout(5000),
+  }).catch(() => {})
+}
+
+async function serveFunding(res, { venueIds, markets, ip, apiKey, payment, usdSpent, extraHeaders = {} }) {
+  const rows = await fundingPulse({ venue_ids: venueIds, markets })
+  recordUsage({ keyId: apiKey?.id, ip, usdSpent })
+  const billed = usageFor(apiKey?.id || `ip:${ip}`)
+  const ipUsage = ipUsageFor(ip)
+  pushDashboardStats({
+    service: "perps-funding-pulse",
+    requests: billed.count + (apiKey ? ipUsage.count : 0),
+    revenue_usd: billed.usdSpent,
+    markets: rows.length,
+    ts: new Date().toISOString(),
+  })
+  const webhooks = await checkWebhooks(rows)
+  return json(res, 200, {
+    service: "perps-funding-pulse",
+    version: VERSION,
+    payment,
+    results: rows,
+    webhooks,
+    ts: new Date().toISOString(),
+  }, extraHeaders)
+}
+
+function callerKey(req) {
+  const raw = headerOne(req, "x-api-key")
+  if (!raw) return { key: null }
+  const key = validateKey(raw)
+  if (!key) return { error: true }
+  return { key }
+}
+
+async function handleFunding(req, res, body, url) {
+  const ip = clientIp(req)
+  const caller = callerKey(req)
+  if (caller.error) return json(res, 401, { error: "invalid_api_key" })
+  const apiKey = caller.key
+  if (!allowBurst(ip)) return json(res, 429, { error: "rate_limit_exceeded", retry_after_seconds: 60 })
+
+  let venueIds
+  let markets
+  try {
+    venueIds = stringList(body.venue_ids, 10)
+    markets = stringList(body.markets, 20)
+  } catch {
+    return json(res, 400, { error: "invalid_request", message: "venue_ids and markets must be arrays of strings" })
+  }
+
+  const resource = resourceOf(req, url)
+  const txHash = headerOne(req, "x-payment-tx")
+  const signature = headerOne(req, "payment-signature") || headerOne(req, "x-payment")
+  const presented = Boolean(txHash || signature)
+  const tier = apiKey?.tier || "anonymous"
+
+  if (tier === "enterprise" && !presented) {
+    const quota = tryConsume(enterpriseQuotaId(apiKey.id), enterpriseLimit())
+    if (!quota.allowed) {
+      return json(res, 429, { error: "rate_limit_exceeded", tier, limit: quota.limit, remaining: 0 })
+    }
+    return serveFunding(res, {
+      venueIds,
+      markets,
+      ip,
+      apiKey,
+      usdSpent: 0,
+      payment: { via: "enterprise", key_id: apiKey.id, tier, remaining: quota.remaining, limit: quota.limit },
     })
   }
 
-  if (req.method === "POST" && url.pathname === "/funding") {
-    const clientIp = getClientIp(req)
-    const apiKey = await requireApiKey(req)
-    if (apiKey) {
-      const rl = await checkKeyRateLimit(apiKey)
-      if (!rl.allowed) {
-        return json(res, 429, { error: "rate_limit_exceeded", tier: apiKey.tier, limit: rl.limit, remaining: 0 })
-      }
-    } else {
-      if (!checkFundingRate(clientIp)) {
-        return json(res, 429, { error: "rate_limit_exceeded", retryAfter: 60 })
+  if (!presented && tier !== "paid") {
+    const limit = freeLimit()
+    const ipId = freeQuotaId(null, ip)
+    const keyId = apiKey ? freeQuotaId(apiKey.id, null) : null
+    const ipPeek = peekQuota(ipId, limit)
+    const keyPeek = keyId ? peekQuota(keyId, limit) : { allowed: true }
+    if (ipPeek.allowed && keyPeek.allowed) {
+      const ipQuota = tryConsume(ipId, limit)
+      const keyQuota = keyId ? tryConsume(keyId, limit) : ipQuota
+      if (ipQuota.allowed && keyQuota.allowed) {
+        return serveFunding(res, {
+          venueIds,
+          markets,
+          ip,
+          apiKey,
+          usdSpent: 0,
+          payment: {
+            via: "free",
+            tier: tier === "anonymous" ? "free" : tier,
+            ...(apiKey ? { key_id: apiKey.id } : {}),
+            remaining: Math.min(ipQuota.remaining, keyQuota.remaining),
+            limit,
+          },
+        })
       }
     }
+  }
 
-    const txHash = req.headers["x-payment-tx"]
-    if (!apiKey && !txHash) {
-      const terms = await paymentTerms(PRICE_USD)
-      return json(
-        res,
-        402,
-        {
-          error: "payment_required",
-          message: `payment required: ${PRICE_USD} USDC on Base`,
-          ways: [
-            {
-              kind: "transfer-and-prove",
-              note: "send USDC or ETH to payTo on Base, then repeat the request with header X-PAYMENT-TX: <tx hash>",
-              asset: USDC_LIKE,
-              payTo: PAY_TO,
-              amount: terms.accepts[0].amount,
-              network: "base",
+  if (!presented) return sendPaymentRequired(res, { reason: "payment_required", resource })
+
+  const quotaId = paidQuotaId(apiKey?.id, ip)
+  const outcome = await acceptPayment({
+    txHash,
+    signature,
+    priceUsd: priceUsd(),
+    resource,
+    beforeSettle: async () => {
+      const quota = peekQuota(quotaId, paidLimit())
+      if (!quota.allowed) {
+        return { ok: false, status: 429, reason: "rate_limit_exceeded", limit: quota.limit, remaining: 0 }
+      }
+      return null
+    },
+  })
+  if (!outcome.ok) {
+    if (outcome.status === 429) {
+      return json(res, 429, { error: "rate_limit_exceeded", tier: "paid", limit: outcome.limit, remaining: 0 })
+    }
+    if (outcome.status === 503) return json(res, 503, { error: outcome.reason })
+    if (outcome.status === 400) return json(res, 400, { error: "invalid_payment", reason: outcome.reason })
+    return sendPaymentRequired(res, { reason: outcome.reason, resource })
+  }
+
+  tryConsume(quotaId, paidLimit())
+  return serveFunding(res, {
+    venueIds,
+    markets,
+    ip,
+    apiKey,
+    usdSpent: outcome.amountUsd,
+    extraHeaders: { "payment-response": paymentResponseHeader(outcome) },
+    payment: {
+      via: outcome.via,
+      asset: outcome.asset,
+      amount_usd: outcome.amountUsd,
+      tx: outcome.tx,
+      payer: outcome.payer,
+      tier: tier === "anonymous" ? "paid" : tier,
+      ...(apiKey ? { key_id: apiKey.id } : {}),
+    },
+  })
+}
+
+export function createApp() {
+  initStore()
+  return createServer(async (req, res) => {
+    try {
+      res.setHeader("access-control-allow-origin", "*")
+      res.setHeader(
+        "access-control-allow-headers",
+        "content-type, payment-signature, x-payment, x-payment-tx, x-api-key, x-admin-token",
+      )
+      res.setHeader("access-control-expose-headers", "payment-required, payment-response")
+      res.setHeader("access-control-max-age", "600")
+      if (req.method === "OPTIONS") {
+        res.writeHead(204)
+        res.end()
+        return
+      }
+
+      const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`)
+
+      if (req.method === "GET" && url.pathname === "/health") {
+        const payTo = payToAddress()
+        return json(res, 200, {
+          status: payTo ? "ok" : "degraded",
+          service: "perps-funding-pulse",
+          version: VERSION,
+          venues: Object.entries(VENUES).map(([id, venue]) => ({ id, name: venue.name, markets: venue.markets })),
+          price_usd: priceUsd(),
+          pay_to: payTo,
+          payee_configured: Boolean(payTo),
+          facilitator_configured: Boolean(facilitatorUrl()),
+          network: "eip155:8453",
+          chain: "base",
+          assets: ["USDC", "ETH"],
+          ts: new Date().toISOString(),
+        })
+      }
+
+      if (req.method === "POST" && url.pathname === "/funding") {
+        let body
+        try {
+          body = await readJson(req)
+        } catch (error) {
+          if (error?.code === "BODY_TOO_LARGE") return json(res, 413, { error: "body_too_large" })
+          return json(res, 400, { error: "invalid_json" })
+        }
+        if (!body || typeof body !== "object" || Array.isArray(body)) {
+          return json(res, 400, { error: "invalid_json" })
+        }
+        return handleFunding(req, res, body, url)
+      }
+
+      if (req.method === "POST" && (url.pathname === "/mcp" || url.pathname === "/mcp/paid")) {
+        const ip = clientIp(req)
+        if (!allowBurst(ip)) return json(res, 429, { error: "rate_limit_exceeded", retry_after_seconds: 60 })
+        let body
+        try {
+          body = await readJson(req)
+        } catch (error) {
+          if (error?.code === "BODY_TOO_LARGE") return json(res, 413, { error: "body_too_large" })
+          return json(res, 400, { error: "invalid_json" })
+        }
+        const resource = resourceOf(req, url)
+        if (url.pathname === "/mcp/paid") {
+          const quotaId = paidQuotaId(null, ip)
+          const out = await handlePaidMcp({
+            body,
+            txHash: headerOne(req, "x-payment-tx"),
+            signature: headerOne(req, "payment-signature") || headerOne(req, "x-payment"),
+            resource,
+            beforeSettle: async () => {
+              const quota = peekQuota(quotaId, paidLimit())
+              if (!quota.allowed) return { ok: false, status: 429, reason: "rate_limit_exceeded", limit: quota.limit, remaining: 0 }
+              return null
             },
-          ],
-          terms,
-        },
-        { "payment-required": Buffer.from(JSON.stringify(terms)).toString("base64") },
-      )
-    }
-
-    let verdict = { ok: true }
-    if (txHash) {
-      verdict = await verifyPayment(txHash, { priceUsd: PRICE_USD })
-      if (!verdict.ok) {
-        const terms = await paymentTerms(PRICE_USD)
-        return json(
-          res,
-          402,
-          { error: "payment_required", reason: verdict.reason, terms },
-          { "payment-required": Buffer.from(JSON.stringify(terms)).toString("base64") },
-        )
+          })
+          if (out.status === 200) tryConsume(quotaId, paidLimit())
+          return json(res, out.status, out.body, out.headers)
+        }
+        const tier = freeTier(ip)
+        if (!tier.allowed) {
+          return sendPaymentRequired(res, {
+            reason: `free tier exhausted (${freeLimit()}/hour)`,
+            resource,
+          })
+        }
+        return json(res, 200, await handleMcp({ body, ip, paid: false }), { "x-free-tier-left": String(tier.left) })
       }
+
+      if (req.method === "POST" && url.pathname === "/keys") {
+        let body
+        try {
+          body = await readJson(req)
+        } catch (error) {
+          if (error?.code === "BODY_TOO_LARGE") return json(res, 413, { error: "body_too_large" })
+          return json(res, 400, { error: "invalid_json" })
+        }
+        const tier = body?.tier || "free"
+        if (!["free", "paid", "enterprise"].includes(tier)) return json(res, 400, { error: "invalid_tier" })
+        if (tier !== "free") {
+          if (!process.env.ADMIN_TOKEN) return json(res, 503, { error: "admin_not_configured" })
+          if (!adminOk(req)) return json(res, 401, { error: "unauthorized" })
+        }
+        const ip = clientIp(req)
+        const quota = tryConsume(`keys:${ip}`, 30)
+        if (!quota.allowed) return json(res, 429, { error: "rate_limit_exceeded" })
+        if (snapshotLength() >= 10_000) return json(res, 503, { error: "key_capacity" })
+        const rec = createKey({ owner: body?.owner || "anonymous", tier })
+        return json(res, 201, { key: rec })
+      }
+
+      if (req.method === "DELETE" && url.pathname.startsWith("/keys/")) {
+        const id = decodeURIComponent(url.pathname.split("/")[2] || "")
+        const caller = callerKey(req)
+        if (caller.error) return json(res, 401, { error: "invalid_api_key" })
+        const owns = caller.key?.id === id
+        if (!owns && !adminOk(req)) {
+          if (!process.env.ADMIN_TOKEN && !owns) return json(res, 401, { error: "unauthorized" })
+          return json(res, 401, { error: "unauthorized" })
+        }
+        if (!revokeKey(id)) return json(res, 404, { error: "key_not_found" })
+        return json(res, 200, { ok: true })
+      }
+
+      if (req.method === "GET" && url.pathname === "/keys") {
+        if (!process.env.ADMIN_TOKEN) return json(res, 503, { error: "admin_not_configured" })
+        if (!adminOk(req)) return json(res, 401, { error: "unauthorized" })
+        return json(res, 200, { keys: listKeys() })
+      }
+
+      if (req.method === "GET" && url.pathname === "/usage") {
+        if (!process.env.ADMIN_TOKEN) return json(res, 503, { error: "admin_not_configured" })
+        if (!adminOk(req)) return json(res, 401, { error: "unauthorized" })
+        return json(res, 200, { usage: billingSummary() })
+      }
+
+      if (req.method === "POST" && url.pathname === "/webhooks") {
+        const caller = callerKey(req)
+        if (caller.error) return json(res, 401, { error: "invalid_api_key" })
+        if (!caller.key) return json(res, 401, { error: "unauthorized", message: "X-API-Key required" })
+        let body
+        try {
+          body = await readJson(req)
+        } catch (error) {
+          if (error?.code === "BODY_TOO_LARGE") return json(res, 413, { error: "body_too_large" })
+          return json(res, 400, { error: "invalid_json" })
+        }
+        const rec = registerWebhook({
+          url: String(body?.url || ""),
+          thresholdPct: body?.threshold_pct ?? body?.threshold ?? 0.0001,
+          ownerKeyId: caller.key.id,
+        })
+        if (rec.error) return json(res, 400, { error: rec.error })
+        return json(res, 201, { webhook: rec })
+      }
+
+      if (req.method === "DELETE" && url.pathname.startsWith("/webhooks/")) {
+        const caller = callerKey(req)
+        if (caller.error) return json(res, 401, { error: "invalid_api_key" })
+        const admin = adminOk(req)
+        if (!caller.key && !admin) return json(res, 401, { error: "unauthorized" })
+        const id = decodeURIComponent(url.pathname.split("/")[2] || "")
+        const ok = unregisterWebhook(id, admin ? undefined : caller.key.id)
+        if (!ok) return json(res, 404, { error: "webhook_not_found" })
+        return json(res, 200, { ok: true })
+      }
+
+      if (req.method === "GET" && url.pathname === "/webhooks") {
+        const caller = callerKey(req)
+        if (caller.error) return json(res, 401, { error: "invalid_api_key" })
+        const admin = adminOk(req)
+        if (!caller.key && !admin) return json(res, 401, { error: "unauthorized" })
+        return json(res, 200, { webhooks: listWebhooks(admin ? undefined : caller.key.id) })
+      }
+
+      return json(res, 404, {
+        error: "not_found",
+        hint: "GET /health, POST /funding, POST /mcp, POST /mcp/paid, POST /keys, GET /usage, POST /webhooks",
+      })
+    } catch (error) {
+      process.stderr.write(`[perps-funding-pulse] ${error?.stack || error}\n`)
+      if (!res.headersSent) json(res, 500, { error: "internal_error" })
+      else res.end()
     }
+  })
+}
 
-    const chunks = []
-    for await (const c of req) chunks.push(c)
-    let body = {}
-    try {
-      body = JSON.parse(Buffer.concat(chunks).toString() || "{}")
-    } catch {}
+function snapshotLength() {
+  return listKeys().length
+}
 
-    const rows = await fundingPulse({
-      venue_ids: body.venue_ids,
-      markets: body.markets,
-    })
+function isDirectRun() {
+  const entry = process.argv[1]
+  if (!entry) return false
+  return import.meta.url === pathToFileURL(entry).href
+}
 
-    const keyId = apiKey?.id
-    recordUsage({ keyId, ip: clientIp, usdSpent: verdict.amountUsd || 0 })
-
-    pushDashboardStats({
-      fundingRates: rows,
-      requests: (USAGE.get(keyId || "")?.count || 0) + (IP_USAGE.get(clientIp)?.count || 0),
-      revenue: Number((USAGE.get(keyId || "")?.usdSpent || 0n) / 1_000_000n),
-      volume: rows.reduce((s, r) => s + (Number(r.open_interest || 0)), 0),
-    })
-
-    // Проверяем webhook-и
-    const webhookResults = await checkWebhooks(rows)
-
-    return json(res, 200, {
-      service: "perps-funding-pulse",
-      version: VERSION,
-      request: body,
-      payment: apiKey ? { via: "api_key", key_id: apiKey.id, tier: apiKey.tier } : { asset: verdict.asset, amount_usd: verdict.amountUsd, tx: verdict.tx },
-      results: rows,
-      webhooks: webhookResults,
-      ts: new Date().toISOString(),
-    })
+if (isDirectRun()) {
+  try {
+    initStore()
+  } catch (error) {
+    process.stderr.write(`[perps-funding-pulse] ${error.message}\n`)
+    process.exit(1)
   }
-
-  if (req.method === "POST" && (url.pathname === "/mcp" || url.pathname === "/mcp/paid")) {
-    const chunks = []
-    for await (const c of req) chunks.push(c)
-    let body = {}
-    try {
-      body = JSON.parse(Buffer.concat(chunks).toString() || "{}")
-    } catch {
-      return json(res, 400, { error: "invalid_json" })
-    }
-    if (url.pathname === "/mcp/paid") {
-      const out = await handlePaidMcp({ body, txHash: req.headers["x-payment-tx"] })
-      return json(res, out.status, out.body, out.headers)
-    }
-    const ip = getClientIp(req)
-    const tier = freeTier(ip)
-    if (!tier.allowed) {
-      const terms = await paymentTerms(PRICE_USD)
-      return json(
-        res,
-        402,
-        {
-          error: "payment_required",
-          message: `free tier exhausted (${FREE_LIMIT}/hour) — use /mcp/paid or pay $${PRICE_USD} USDC on Base`,
-          terms,
-        },
-        { "payment-required": Buffer.from(JSON.stringify(terms)).toString("base64") },
-      )
-    }
-    const out = await handleMcp({ body, ip, paid: false })
-    return json(res, 200, out, { "x-free-tier-left": String(tier.left) })
+  const server = createApp()
+  server.listen(port(), "0.0.0.0", () => {
+    const payTo = payToAddress() || "unset"
+    process.stderr.write(
+      `[perps-funding-pulse] listening on :${port()} · price ${priceUsd()} USD · payTo ${payTo} · version ${VERSION}\n`,
+    )
+  })
+  const shutdown = () => {
+    server.close(() => process.exit(0))
+    setTimeout(() => process.exit(1), 10_000).unref()
   }
-
-  // POST /keys — создать ключ
-  if (req.method === "POST" && url.pathname === "/keys") {
-    const chunks = []
-    for await (const c of req) chunks.push(c)
-    let body = {}
-    try {
-      body = JSON.parse(Buffer.concat(chunks).toString() || "{}")
-    } catch {
-      return json(res, 400, { error: "invalid_json" })
-    }
-    const owner = String(body.owner || "anonymous")
-    const tier = ["free", "paid", "enterprise"].includes(body.tier) ? body.tier : "free"
-    const rec = createKey({ owner, tier })
-    return json(res, 201, { key: rec })
-  }
-
-  // DELETE /keys/:id — отозвать ключ
-  if (req.method === "DELETE" && url.pathname.startsWith("/keys/")) {
-    const id = url.pathname.split("/")[2]
-    const ok = revokeKey(id)
-    if (!ok) return json(res, 404, { error: "key_not_found" })
-    return json(res, 200, { ok: true, message: `key ${id} revoked` })
-  }
-
-  // GET /keys — список ключей
-  if (req.method === "GET" && url.pathname === "/keys") {
-    return json(res, 200, { keys: listKeys() })
-  }
-
-  // GET /usage — сводка по биллингу
-  if (req.method === "GET" && url.pathname === "/usage") {
-    const summary = billingSummary()
-    return json(res, 200, { usage: summary })
-  }
-
-  // POST /webhooks — зарегистрировать webhook
-  if (req.method === "POST" && url.pathname === "/webhooks") {
-    const apiKey = await requireApiKey(req)
-    if (!apiKey) return json(res, 401, { error: "unauthorized", message: "X-API-Key required" })
-    const chunks = []
-    for await (const c of req) chunks.push(c)
-    let body = {}
-    try {
-      body = JSON.parse(Buffer.concat(chunks).toString() || "{}")
-    } catch {
-      return json(res, 400, { error: "invalid_json" })
-    }
-    const urlStr = String(body.url || "")
-    if (!/^https?:\/\//i.test(urlStr)) return json(res, 400, { error: "invalid_url" })
-    const thresholdPct = Math.max(0, Number(body.threshold_pct ?? 0.01))
-    const rec = registerWebhook({ url: urlStr, thresholdPct })
-    return json(res, 201, { webhook: rec })
-  }
-
-  // DELETE /webhooks/:id
-  if (req.method === "DELETE" && url.pathname.startsWith("/webhooks/")) {
-    const id = url.pathname.split("/")[2]
-    const ok = unregisterWebhook(id)
-    if (!ok) return json(res, 404, { error: "webhook_not_found" })
-    return json(res, 200, { ok: true })
-  }
-
-  // GET /webhooks
-  if (req.method === "GET" && url.pathname === "/webhooks") {
-    return json(res, 200, { webhooks: listWebhooks() })
-  }
-
-  return json(res, 404, { error: "not_found", hint: "GET /health, POST /funding, POST /mcp, POST /mcp/paid, POST /keys, GET /keys, GET /usage, POST /webhooks" })
-})
-
-const USDC_LIKE = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
-
-server.listen(PORT, "0.0.0.0", () => {
-  process.stderr.write(
-    `[perps-funding-pulse] listening on :${PORT} · price ${PRICE_USD} USDC · payTo ${PAY_TO} · version ${VERSION}\n`,
-  )
-})
+  process.on("SIGTERM", shutdown)
+  process.on("SIGINT", shutdown)
+}
