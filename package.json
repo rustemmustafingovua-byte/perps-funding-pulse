@@ -19,7 +19,7 @@
   "scripts": {
     "start": "node src/server.js",
     "test": "node --test test/*.test.js",
-    "build": "node -e "console.log('No build step required for perps-funding-pulse')"",
+    "build": "echo 'No build step required for repo'",
     "lint": "node --check src/server.js && node --check src/venues.js && node --check src/x402.js && node --check src/keys.js && node --check src/usage.js && node --check src/webhooks.js && node --check src/mcp.js"
   },
   "dependencies": {
