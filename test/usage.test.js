@@ -1,6 +1,10 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { recordUsage, usageFor, ipUsageFor, billingSummary } from "../src/usage.js"
+import { recordUsage, usageFor, ipUsageFor, billingSummary, tryConsume, __shiftQuotaWindow } from "../src/usage.js"
+import { resetStore } from "../src/store.js"
+
+delete process.env.DATA_FILE
+resetStore()
 
 test("recordUsage increments key and ip counts", () => {
   recordUsage({ keyId: "k1", ip: "1.2.3.4", usdSpent: 0.001 })
@@ -19,6 +23,14 @@ test("usageFor returns zeros for unknown id", () => {
 test("ipUsageFor returns zeros for unknown ip", () => {
   const u = ipUsageFor("0.0.0.0")
   assert.equal(u.count, 0)
+})
+
+test("hourly quota resets after the window", () => {
+  const id = "quota-window"
+  assert.equal(tryConsume(id, 1).allowed, true)
+  assert.equal(tryConsume(id, 1).allowed, false)
+  __shiftQuotaWindow(id, -3_600_001)
+  assert.equal(tryConsume(id, 1).allowed, true)
 })
 
 test("billingSummary aggregates totals", () => {

@@ -7,9 +7,11 @@ Thanks for your interest in contributing!
 ```bash
 git clone https://github.com/rustemmustafingovua-byte/perps-funding-pulse.git
 cd perps-funding-pulse
-npm install
+npm ci
 npm test
 ```
+
+`npm test` does not need network access, a wallet, or an API key. Do not commit `.env`.
 
 ## Guidelines
 

@@ -1,24 +1,36 @@
 /**
- * Источники данных по перпетуалам — только публичные API, без ключей.
- *
- * Каждая площадка отдаёт: ставку фандинга, время следующего тика и открытый
- * интерес. Мы нормализуем всё в единый формат и считаем перекос лонг/шорт.
+ * Public perpetual-futures market data. No venue API key is required.
+ * One venue failing does not drop the others.
  */
 
-const TIMEOUT = 12000
+const TIMEOUT_MS = 12_000
 
-async function getJson(url, headers = {}) {
-  const res = await fetch(url, { headers, signal: AbortSignal.timeout(TIMEOUT) })
+export function venueSymbol(venue, market) {
+  const stripped = String(market ?? "").trim().toUpperCase().replace(/-SWAP$/, "")
+  const parts = stripped.split(/[/\s_-]+/).filter(Boolean)
+  const symbol = venue === "okx"
+    ? (parts.length >= 2 ? `${parts[0]}-${parts[1]}-SWAP` : `${stripped}-SWAP`)
+    : (parts.length >= 2 ? `${parts[0]}${parts[1]}` : stripped.replace(/[^A-Z0-9]/g, ""))
+  if (!/^[A-Z0-9-]{2,40}$/.test(symbol)) {
+    throw new Error(`invalid market "${market}"`)
+  }
+  return symbol
+}
+
+async function getJson(url, fetchImpl) {
+  const res = await fetchImpl(url, {
+    headers: { accept: "application/json", "user-agent": "perps-funding-pulse" },
+    signal: AbortSignal.timeout(TIMEOUT_MS),
+  })
   if (!res.ok) throw new Error(`${url} → HTTP ${res.status}`)
   return res.json()
 }
 
-/** Binance USDⓈ-M: funding rate + next tick + open interest. */
-async function binance(market) {
-  const symbol = market.replace("/", "").replace("-", "").toUpperCase()
+async function binance(market, fetchImpl) {
+  const symbol = venueSymbol("binance", market)
   const [premium, oi] = await Promise.all([
-    getJson(`https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${symbol}`),
-    getJson(`https://fapi.binance.com/fapi/v1/openInterest?symbol=${symbol}`).catch(() => null),
+    getJson(`https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${symbol}`, fetchImpl),
+    getJson(`https://fapi.binance.com/fapi/v1/openInterest?symbol=${symbol}`, fetchImpl).catch(() => null),
   ])
   return {
     funding_rate: Number(premium.lastFundingRate),
@@ -29,14 +41,14 @@ async function binance(market) {
   }
 }
 
-/** Bybit linear: funding + OI + long/short ratio. */
-async function bybit(market) {
-  const symbol = market.replace("/", "").replace("-", "").toUpperCase()
-  const t = await getJson(
+async function bybit(market, fetchImpl) {
+  const symbol = venueSymbol("bybit", market)
+  const body = await getJson(
     `https://api.bybit.com/v5/market/tickers?category=linear&symbol=${symbol}`,
+    fetchImpl,
   )
-  const row = t?.result?.list?.[0]
-  if (!row) throw new Error(`bybit: нет ${symbol}`)
+  const row = body?.result?.list?.[0]
+  if (!row) throw new Error(`bybit: no ${symbol}`)
   const ratio = Number(row.longShortRatio ?? 0)
   return {
     funding_rate: Number(row.fundingRate),
@@ -48,15 +60,14 @@ async function bybit(market) {
   }
 }
 
-/** OKX swap: funding + next tick + OI. */
-async function okx(market) {
-  const instId = market.replace("/", "-").replace("-SWAP", "-SWAP").toUpperCase()
-  const [fr, oi] = await Promise.all([
-    getJson(`https://www.okx.com/api/v5/public/funding-rate?instId=${instId}`),
-    getJson(`https://www.okx.com/api/v5/public/open-interest?instType=SWAP&instId=${instId}`).catch(() => null),
+async function okx(market, fetchImpl) {
+  const instId = venueSymbol("okx", market)
+  const [funding, oi] = await Promise.all([
+    getJson(`https://www.okx.com/api/v5/public/funding-rate?instId=${instId}`, fetchImpl),
+    getJson(`https://www.okx.com/api/v5/public/open-interest?instType=SWAP&instId=${instId}`, fetchImpl).catch(() => null),
   ])
-  const row = fr?.data?.[0]
-  if (!row) throw new Error(`okx: нет ${instId}`)
+  const row = funding?.data?.[0]
+  if (!row) throw new Error(`okx: no ${instId}`)
   return {
     funding_rate: Number(row.fundingRate),
     time_to_next: Math.max(0, Math.floor((Number(row.nextFundingTime) - Date.now()) / 1000)),
@@ -72,8 +83,8 @@ export const VENUES = {
   okx: { name: "OKX", fn: okx, markets: ["BTC-USDT-SWAP", "ETH-USDT-SWAP"] },
 }
 
-/** Данные по всем площадкам и рынкам. Ошибка одной площадки не роняет остальные. */
-export async function fundingPulse({ venue_ids = Object.keys(VENUES), markets } = {}) {
+/** Live funding, time to the next tick, open interest, and skew. */
+export async function fundingPulse({ venue_ids = Object.keys(VENUES), markets, fetchImpl = globalThis.fetch } = {}) {
   const requested = venue_ids ?? Object.keys(VENUES)
   const out = []
   for (const venue of requested) {
@@ -83,16 +94,14 @@ export async function fundingPulse({ venue_ids = Object.keys(VENUES), markets } 
       continue
     }
     const list = markets?.length ? markets : spec.markets
-    const rows = await Promise.all(
-      list.map(async (market) => {
-        try {
-          const data = await spec.fn(market)
-          return { venue, market, ...data, ok: true }
-        } catch (e) {
-          return { venue, market, ok: false, error: e?.message ?? String(e) }
-        }
-      }),
-    )
+    const rows = await Promise.all(list.map(async (market) => {
+      try {
+        const data = await spec.fn(market, fetchImpl)
+        return { venue, market, ...data, ok: true }
+      } catch (error) {
+        return { venue, market, ok: false, error: error?.message ?? String(error) }
+      }
+    }))
     out.push(...rows)
   }
   return out

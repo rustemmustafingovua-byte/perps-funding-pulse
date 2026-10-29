@@ -1,0 +1,31 @@
+# Render web service. Create the service from this file, then set the secret env vars
+# in the dashboard (they are marked sync: false so they are never committed).
+services:
+  - type: web
+    name: perps-funding-pulse
+    runtime: docker
+    plan: starter
+    healthCheckPath: /health
+    disk:
+      name: perps-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATA_FILE
+        value: /data/state.json
+      - key: TRUST_PROXY
+        value: "1"
+      - key: PRICE_USD
+        value: "0.001"
+      - key: BASE_RPC
+        value: https://mainnet.base.org
+      - key: X402_PAY_TO
+        sync: false
+      - key: ADMIN_TOKEN
+        sync: false
+      - key: X402_FACILITATOR_URL
+        sync: false
+      - key: X402_FACILITATOR_AUTH
+        sync: false

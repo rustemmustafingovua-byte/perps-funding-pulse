@@ -2,6 +2,8 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 import { createKey, revokeKey, getKey, listKeys, validateKey, __clearKeys } from "../src/keys.js"
 
+delete process.env.DATA_FILE
+
 test("createKey creates a key with prefixed secret", () => {
   __clearKeys()
   const rec = createKey({ owner: "alice", tier: "paid" })
@@ -31,6 +33,15 @@ test("revokeKey marks key revoked and validateKey rejects it", () => {
   assert.equal(revokeKey("does-not-exist"), false)
   assert.equal(getKey(rec.id).revoked, true)
   assert.equal(validateKey(rec.key), null)
+})
+
+test("validateKey rejects a secret that does not match", () => {
+  __clearKeys()
+  const rec = createKey({ owner: "mallory" })
+  const forged = `${rec.key.slice(0, -1)}${rec.key.endsWith("a") ? "b" : "a"}`
+  assert.notEqual(forged, rec.key)
+  assert.equal(validateKey(forged), null)
+  assert.equal(validateKey(rec.key).id, rec.id)
 })
 
 test("listKeys returns ids only", () => {

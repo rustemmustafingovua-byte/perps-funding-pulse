@@ -1,6 +1,6 @@
 {
   "name": "perps-funding-pulse",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Live funding rates, next tick and open interest for perps markets, served over x402 — pay per call in USDC or ETH on Base.",
   "type": "module",
   "license": "MIT",
@@ -14,13 +14,20 @@
     "node": ">=20"
   },
   "keywords": [
-    "x402", "perps", "funding-rate", "agents", "base", "usdc", "crypto", "defi"
+    "x402",
+    "perps",
+    "funding-rate",
+    "agents",
+    "base",
+    "usdc",
+    "crypto",
+    "defi"
   ],
   "scripts": {
     "start": "node src/server.js",
     "test": "node --test test/*.test.js",
-    "build": "echo 'No build step required for repo'",
-    "lint": "node --check src/server.js && node --check src/venues.js && node --check src/x402.js && node --check src/keys.js && node --check src/usage.js && node --check src/webhooks.js && node --check src/mcp.js"
+    "lint": "node scripts/check-syntax.js",
+    "build": "node scripts/check-syntax.js"
   },
   "dependencies": {
     "viem": "^2.57.7"
